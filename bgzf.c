@@ -190,6 +190,8 @@ static const char *bgzf_zerr(int errnum, z_stream *zs)
         return "progress temporarily not possible, or in() / out() returned an error";
     case Z_VERSION_ERROR:
         return "zlib version mismatch";
+    case Z_NEED_DICT:
+        return "data was compressed using a dictionary";
     case Z_OK: // 0: maybe gzgets error Z_NULL
     default:
         snprintf(buffer, sizeof(buffer), "[%d] unknown", errnum);
@@ -466,36 +468,100 @@ static int inflate_block(BGZF* fp, int block_length)
     return dlen;
 }
 
-static int inflate_gzip_block(BGZF *fp, int cached)
+// Decompress the next part of a non-blocked GZIP file.
+// Return the number of uncompressed bytes read, 0 on EOF, or a negative number on error.
+// Will fill the output buffer unless the end of the GZIP file is reached.
+static int inflate_gzip_block(BGZF *fp)
 {
-    int ret = Z_OK;
-    do
-    {
-        if ( !cached && fp->gz_stream->avail_out!=0 )
-        {
-            fp->gz_stream->avail_in = hread(fp->fp, fp->compressed_block, BGZF_BLOCK_SIZE);
-            if ( fp->gz_stream->avail_in<=0 ) return fp->gz_stream->avail_in;
-            if ( fp->gz_stream->avail_in==0 ) break;
+
+    fprintf(stderr, "inflate a block\n");
+
+    int input_eof = 0;
+    
+    // Write to the part of the output buffer after block_offset
+    fp->gz_stream->next_out = (Bytef*)fp->uncompressed_block + fp->block_offset;
+    fp->gz_stream->avail_out = BGZF_MAX_BLOCK_SIZE - fp->block_offset;
+    
+    while ( fp->gz_stream->avail_out != 0 ) {
+        // Until we fill the output buffer (or hit EOF)
+        
+        fprintf(stderr, "\tloop\n");
+        
+        if ( !input_eof && fp->gz_stream->avail_in == 0 ) {
+            // We are out of input data in the buffer. Get more.
+            
+            fprintf(stderr, "\t\tNeed more data\n");
+            
             fp->gz_stream->next_in = fp->compressed_block;
-        }
-        else cached = 0;
-        do
-        {
-            fp->gz_stream->next_out = (Bytef*)fp->uncompressed_block + fp->block_offset;
-            fp->gz_stream->avail_out = BGZF_MAX_BLOCK_SIZE - fp->block_offset;
-            fp->gz_stream->msg = NULL;
-            ret = inflate(fp->gz_stream, Z_NO_FLUSH);
-            if (ret < 0 && ret != Z_BUF_ERROR) {
-                hts_log_error("Inflate operation failed: %s", bgzf_zerr(ret, ret == Z_DATA_ERROR ? fp->gz_stream : NULL));
-                fp->errcode |= BGZF_ERR_ZLIB;
-                return -1;
+            fp->gz_stream->avail_in = hread(fp->fp, fp->compressed_block, BGZF_BLOCK_SIZE);
+            if ( fp->gz_stream->avail_in < 0 ) {
+                // hread had an error. Pass it on.
+                return fp->gz_stream->avail_in;
             }
-            unsigned int have = BGZF_MAX_BLOCK_SIZE - fp->gz_stream->avail_out;
-            if ( have ) return have;
+            if ( fp->gz_stream->avail_in < BGZF_BLOCK_SIZE ) {
+                // We have reached EOF. But the decompressor hasn't necessarily.
+                input_eof = 1;
+                fprintf(stderr, "\t\t\tHit EOF\n");
+            } else {
+                fprintf(stderr, "\t\t\tGot %d\n", fp->gz_stream->avail_in);
+            }
         }
-        while ( fp->gz_stream->avail_out == 0 );
+        
+        fprintf(stderr, "\t\tHave %d available out and %d available in before inflate\n", fp->gz_stream->avail_out, fp->gz_stream->avail_in);
+        
+        fp->gz_stream->msg = NULL;
+        // Decompress as much data as we can
+        int ret = inflate(fp->gz_stream, Z_SYNC_FLUSH);
+        
+        fprintf(stderr, "\t\tinflate says: %d\n", ret);
+        
+        fprintf(stderr, "\t\tHave %d available out and %d available in after inflate\n", fp->gz_stream->avail_out, fp->gz_stream->avail_in);
+        
+        if ( (ret < 0 && ret != Z_BUF_ERROR) || ret == Z_NEED_DICT ) {
+            // An error occurred, other than running out of space
+            hts_log_error("Inflate operation failed: %s", bgzf_zerr(ret, ret == Z_DATA_ERROR ? fp->gz_stream : NULL));
+            fp->errcode |= BGZF_ERR_ZLIB;
+            return -1;
+        } else if ( ret == Z_STREAM_END ) {
+            // We finished a GZIP member.
+            
+            fprintf(stderr, "\t\tStream done\n");
+            
+            if ( input_eof ) {
+                // We are done with the last stream in the file
+                fprintf(stderr, "\t\t\tAlso, file over\n");
+                break;
+            } else if (fp->gz_stream->avail_in > 0) {
+                // Try and read another GZIP member. in the remaining data
+                fprintf(stderr, "\t\t\tLook for another member in %d available bytes\n", fp->gz_stream->avail_in);
+                int reset_ret = inflateReset(fp->gz_stream);
+                if (reset_ret != Z_OK) {
+                    hts_log_error("Call to inflateReset failed: %s", bgzf_zerr(reset_ret, reset_ret == Z_DATA_ERROR ? fp->gz_stream : NULL));
+                    fp->errcode |= BGZF_ERR_ZLIB;
+                    return -1;
+                }
+            }
+            // Otherwise, we finished the stream and we consumed all the input we had.
+            // Leave the decompressor in the finished state; we will reset it if we go to get more data and we don't find an EOF.
+            fprintf(stderr, "\t\t\tLoop again to see if we need to decompress more\n");
+        } else if ( ret == Z_BUF_ERROR && input_eof && fp->gz_stream->avail_out > 0 ) {
+            // The decompressor is complaining about buffers, and the problem has to be the input being insufficient, but we are out of input.
+            // The gzip file has ended prematurely.
+            
+            fprintf(stderr, "\t\tEOF and need more data\n");
+            
+            hts_log_error("Gzip file truncated");
+            fp->errcode |= BGZF_ERR_IO;
+            return -1;
+        }
+        // Otherwise either we succeeded or we have filled/depleted a buffer. Loop around again.
     }
-    while (ret != Z_STREAM_END);
+    
+    // When we get here, the buffer is full or there is an EOF after a complete gzip member.
+    
+    fprintf(stderr, "\tHave %d available out and %d available in at end\n", fp->gz_stream->avail_out, fp->gz_stream->avail_in);
+    
+    // Return the number of bytes of data in the buffer
     return BGZF_MAX_BLOCK_SIZE - fp->gz_stream->avail_out;
 }
 
@@ -705,7 +771,7 @@ int bgzf_read_block(BGZF *fp)
     block_address = bgzf_htell(fp);
     if ( fp->is_gzip && fp->gz_stream ) // is this is an initialized gzip stream?
     {
-        count = inflate_gzip_block(fp, 0);
+        count = inflate_gzip_block(fp);
         if ( count<0 )
         {
             fp->errcode |= BGZF_ERR_ZLIB;
@@ -741,47 +807,20 @@ int bgzf_read_block(BGZF *fp)
             uint8_t *cblock = (uint8_t*)fp->compressed_block;
             memcpy(cblock, header, sizeof(header));
             count = hread(fp->fp, cblock+sizeof(header), BGZF_BLOCK_SIZE - sizeof(header)) + sizeof(header);
-            int nskip = 10;
-
-            // Check optional fields to skip: FLG.FNAME,FLG.FCOMMENT,FLG.FHCRC,FLG.FEXTRA
-            // Note: Some of these fields are untested, I did not have appropriate data available
-            if ( header[3] & 0x4 ) // FLG.FEXTRA
-            {
-                nskip += unpackInt16(&cblock[nskip]) + 2;
-            }
-            if ( header[3] & 0x8 ) // FLG.FNAME
-            {
-                while ( nskip<count && cblock[nskip] ) nskip++;
-                nskip++;
-            }
-            if ( header[3] & 0x10 ) // FLG.FCOMMENT
-            {
-                while ( nskip<count && cblock[nskip] ) nskip++;
-                nskip++;
-            }
-            if ( header[3] & 0x2 ) nskip += 2;  //  FLG.FHCRC
-
-            /* FIXME: Should handle this better.  There's no reason why
-               someone shouldn't include a massively long comment in their
-               gzip stream. */
-            if ( nskip >= count )
-            {
-                fp->errcode |= BGZF_ERR_HEADER;
-                return -1;
-            }
 
             fp->is_gzip = 1;
             fp->gz_stream = (z_stream*) calloc(1,sizeof(z_stream));
-            int ret = inflateInit2(fp->gz_stream, -15);
+            // Set up zlib, using a window size of 15, and its built-in GZIP header processing (+16).
+            int ret = inflateInit2(fp->gz_stream, 15 + 16);
             if (ret != Z_OK)
             {
                 hts_log_error("Call to inflateInit2 failed: %s", bgzf_zerr(ret, fp->gz_stream));
                 fp->errcode |= BGZF_ERR_ZLIB;
                 return -1;
             }
-            fp->gz_stream->avail_in = count - nskip;
-            fp->gz_stream->next_in  = cblock + nskip;
-            count = inflate_gzip_block(fp, 1);
+            fp->gz_stream->avail_in = count;
+            fp->gz_stream->next_in  = cblock;
+            count = inflate_gzip_block(fp);
             if ( count<0 )
             {
                 fp->errcode |= BGZF_ERR_ZLIB;
