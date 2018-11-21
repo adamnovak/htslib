@@ -213,8 +213,8 @@ static const char *bgzf_zerr(int errnum, z_stream *zs)
 static BGZF *bgzf_read_init(hFILE *hfpr)
 {
     BGZF *fp;
-    uint8_t magic[18];
-    ssize_t n = hpeek(hfpr, magic, 18);
+    uint8_t magic[BLOCK_HEADER_LENGTH];
+    ssize_t n = hpeek(hfpr, magic, BLOCK_HEADER_LENGTH);
     if (n < 0) return NULL;
 
     fp = (BGZF*)calloc(1, sizeof(BGZF));
@@ -224,7 +224,7 @@ static BGZF *bgzf_read_init(hFILE *hfpr)
     fp->uncompressed_block = malloc(2 * BGZF_MAX_BLOCK_SIZE);
     if (fp->uncompressed_block == NULL) { free(fp); return NULL; }
     fp->compressed_block = (char *)fp->uncompressed_block + BGZF_MAX_BLOCK_SIZE;
-    fp->is_compressed = (n==18 && magic[0]==0x1f && magic[1]==0x8b);
+    fp->is_compressed = (n==BLOCK_HEADER_LENGTH && magic[0]==0x1f && magic[1]==0x8b);
     fp->is_gzip = ( !fp->is_compressed || ((magic[3]&4) && memcmp(&magic[12], "BC\2\0",4)==0) ) ? 0 : 1;
 #ifdef BGZF_CACHE
     if (!(fp->cache = malloc(sizeof(*fp->cache)))) {
@@ -365,11 +365,14 @@ BGZF *bgzf_hopen(hFILE *hfp, const char *mode)
     return fp;
 }
 
+static int bgzf_uncompress(uint8_t *dst, size_t *dlen, const uint8_t *src, size_t slen);
+
 #ifdef HAVE_LIBDEFLATE
 int bgzf_compress(void *_dst, size_t *dlen, const void *src, size_t slen, int level)
 {
     if (slen == 0) {
         // EOF block
+        hts_log_error("Producing EOF block");
         if (*dlen < 28) return -1;
         memcpy(_dst, "\037\213\010\4\0\0\0\0\0\377\6\0\102\103\2\0\033\0\3\0\0\0\0\0\0\0\0\0", 28);
         *dlen = 28;
@@ -418,6 +421,66 @@ int bgzf_compress(void *_dst, size_t *dlen, const void *src, size_t slen, int le
     uint32_t crc = libdeflate_crc32(0, src, slen);
     packInt32((uint8_t*)&dst[*dlen - 8], crc);
     packInt32((uint8_t*)&dst[*dlen - 4], slen);
+    
+    // Now check our work
+    
+    // Dump the footer
+    // We hit the too many doublings threshold
+    hts_log_error("Dumping %d byte footer of newly constructed block", (int)BLOCK_FOOTER_LENGTH);
+    for (size_t i = 0; i < BLOCK_FOOTER_LENGTH; i++) {
+        fprintf(stderr, "%02X", dst[*dlen  - (BLOCK_FOOTER_LENGTH - i)]);
+        if ((i + 1) % 64 == 0) {
+            fprintf(stderr, "\n");
+        }
+    }
+    fprintf(stderr, "\n");
+    
+    // Read the recorded size of the block's decompressed contents
+    size_t expected_decompressed_size = le_to_u32(dst + *dlen-4);
+    size_t returned_decompressed_size = expected_decompressed_size;
+    
+    if (expected_decompressed_size > BGZF_BLOCK_SIZE) {
+        // This block is too big and the file is not BGZF
+        hts_log_error("Block we just made purports to decompress to %zu bytes but maximum is %d; we made a mistake", expected_decompressed_size, (int)BGZF_BLOCK_SIZE);
+        return -1;
+    }
+    
+    uint8_t* check_buffer = (uint8_t*) malloc(expected_decompressed_size);
+    assert(check_buffer != NULL);
+    
+    // Decompress the part of the block we got from the compression.
+    // Don't pass along the trailing checksum/length we added, or the header.
+    int ret = bgzf_uncompress(check_buffer, &returned_decompressed_size,
+                              (Bytef*)dst + BLOCK_HEADER_LENGTH, *dlen - BLOCK_HEADER_LENGTH - BLOCK_FOOTER_LENGTH);
+    if (ret < 0) {
+        hts_log_error("Block could not be decompressed back: %d", ret);
+        return -1;
+    }
+    
+    // Check CRC of uncompressed block matches the footer.
+    // NB: we may wish to switch out the zlib crc32 for something more performant.
+    // See PR#361 and issue#467
+#ifdef HAVE_LIBDEFLATE
+    uint32_t c1 = libdeflate_crc32(0L, (unsigned char *)check_buffer, expected_decompressed_size);
+#else
+    uint32_t c1 = crc32(0L, (unsigned char *)check_buffer, expected_decompressed_size);
+#endif
+    uint32_t c2 = le_to_u32((uint8_t *)dst + *dlen - 8);
+    if (c1 != c2) {
+        hts_log_error("CRC mismatch on compression: %d vs %d", c1, c2);
+        return -1;
+    } else {
+        hts_log_error("CRC match on re-decompression: %d for length %zu", c1, slen);
+    }
+    
+    // If the CRC matches, make sure the recorded size was right
+    // Note that bgzf_uncompress may also check this
+    if (slen != expected_decompressed_size) {
+        // We got a different length back than our original length
+        hts_log_error("Saved length %zu to file but should have been %zu", expected_decompressed_size, slen);
+        return -1;
+    }
+    
     return 0;
 }
 
@@ -517,20 +580,62 @@ static int deflate_block(BGZF *fp, int block_length)
 #ifdef HAVE_LIBDEFLATE
 
 static int bgzf_uncompress(uint8_t *dst, size_t *dlen, const uint8_t *src, size_t slen) {
+    
+    // We believe dlen about the exact decompressed size we should find.
+    size_t internal_buffer_size = *dlen;
+    int decompress_return_value = LIBDEFLATE_SUCCESS;
+    
+    
+    hts_log_error("Allocate decompressor");
+
     struct libdeflate_decompressor *z = libdeflate_alloc_decompressor();
     if (!z) {
         hts_log_error("Call to libdeflate_alloc_decompressor failed");
         return -1;
     }
+    
+    hts_log_error("Allocate buffer");
 
-    int ret = libdeflate_deflate_decompress(z, src, slen, dst, *dlen, dlen);
+    uint8_t* bigger_buffer = (uint8_t*) malloc(internal_buffer_size);
+    assert(bigger_buffer != NULL);
+    
+    hts_log_error("Decompress %zu compressed bytes into size %zu output buffer", slen, internal_buffer_size);
+    
+    // Tell libdeflate we know the actual outout size and it should complain if the compressed data doesn't agree
+    decompress_return_value = libdeflate_deflate_decompress(z, src, slen, bigger_buffer, internal_buffer_size, NULL);
     libdeflate_free_decompressor(z);
+    
+    hts_log_error("Got return code: %d", decompress_return_value);
 
-    if (ret != LIBDEFLATE_SUCCESS) {
-        hts_log_error("Inflate operation failed: %d", ret);
+   if (decompress_return_value != LIBDEFLATE_SUCCESS) {
+        hts_log_error("Inflate operation failed: %d", decompress_return_value);
+        assert(0);
+    } else {
+        // Decompress succeeded
+        memcpy((void*)dst, (void*)bigger_buffer, internal_buffer_size);
+        *dlen = internal_buffer_size;   
+    }
+    
+    hts_log_error("Free buffer");
+    
+    free((void*)bigger_buffer);
+        
+    
+    if (decompress_return_value != LIBDEFLATE_SUCCESS) {
+        // We hit the too many doublings threshold
+        hts_log_error("Dumping %zu bytes of input data that cause a problem", slen);
+        // Dump the source data in hex
+        for (size_t i = 0; i < slen; i++) {
+            fprintf(stderr, "%02X", src[i]);
+            if ((i + 1) % 64 == 0) {
+                fprintf(stderr, "\n");
+            }
+        }
+        fprintf(stderr, "\n");
+        assert(0);
         return -1;
     }
-
+    
     return 0;
 }
 
@@ -570,15 +675,39 @@ static int bgzf_uncompress(uint8_t *dst, size_t *dlen, const uint8_t *src, size_
 // Inflate the block in fp->compressed_block into fp->uncompressed_block
 static int inflate_block(BGZF* fp, int block_length)
 {
-    size_t dlen = BGZF_MAX_BLOCK_SIZE;
+    // Dump the footer
+    // We hit the too many doublings threshold
+    hts_log_error("Dumping %d byte footer for next block", (int)BLOCK_FOOTER_LENGTH);
+    for (size_t i = 0; i < BLOCK_FOOTER_LENGTH; i++) {
+        fprintf(stderr, "%02X", ((uint8_t*)fp->compressed_block)[block_length  - (BLOCK_FOOTER_LENGTH - i)]);
+        if ((i + 1) % 64 == 0) {
+            fprintf(stderr, "\n");
+        }
+    }
+    fprintf(stderr, "\n");
+    
+    // Read the recorded size of the block's decompressed contents
+    size_t expected_decompressed_size = le_to_u32((uint8_t *)fp->compressed_block + block_length-4);
+    
+    if (expected_decompressed_size > BGZF_MAX_BLOCK_SIZE) {
+        // This block is too big and the file is not BGZF
+        hts_log_error("Block in file purports to decompress to %zu bytes but maximum is %d; file is not valid BGZF", expected_decompressed_size, (int)BGZF_MAX_BLOCK_SIZE);
+        fp->errcode |= BGZF_ERR_IO;
+        return -1;
+    }
+    
+    // Pass that along as the exact correct decompressed size.
+    size_t dlen = expected_decompressed_size;
+    // Decompress the part of the block we got from the compression.
+    // Don't pass along the trailing checksum/length we added, or the header.
     int ret = bgzf_uncompress(fp->uncompressed_block, &dlen,
-                              (Bytef*)fp->compressed_block + 18, block_length - 18);
+                              (Bytef*)fp->compressed_block + BLOCK_HEADER_LENGTH, block_length - BLOCK_HEADER_LENGTH - BLOCK_FOOTER_LENGTH);
     if (ret < 0) {
         fp->errcode |= BGZF_ERR_ZLIB;
         return -1;
     }
-
-    // Check CRC of uncompressed block matches the gzip header.
+    
+    // Check CRC of uncompressed block matches the footer.
     // NB: we may wish to switch out the zlib crc32 for something more performant.
     // See PR#361 and issue#467
 #ifdef HAVE_LIBDEFLATE
@@ -589,6 +718,17 @@ static int inflate_block(BGZF* fp, int block_length)
     uint32_t c2 = le_to_u32((uint8_t *)fp->compressed_block + block_length-8);
     if (c1 != c2) {
         fp->errcode |= BGZF_ERR_CRC;
+        return -1;
+    } else {
+        hts_log_error("Correct checksum for decompressed block: %d", c1);
+    }
+    
+    // If the CRC matches, make sure the recorded size was right
+    // Note that bgzf_uncompress may also check this
+    if (dlen != expected_decompressed_size) {
+        // The file is corrupt; the block decompressed to a different size than it should have.
+        hts_log_error("Corrupt file: decompressed block has size %zu but %zu recorded in file", dlen, expected_decompressed_size);
+        fp->errcode |= BGZF_ERR_IO;
         return -1;
     }
 
@@ -886,6 +1026,9 @@ int bgzf_read_block(BGZF *fp)
     // Reading compressed file
     int64_t block_address;
     block_address = bgzf_htell(fp);
+    
+    hts_log_error("Reading block from %zu", block_address);
+    
     if ( fp->is_gzip && fp->gz_stream ) // is this is an initialized gzip stream?
     {
         count = inflate_gzip_block(fp);
@@ -950,6 +1093,7 @@ int bgzf_read_block(BGZF *fp)
         }
         size = count;
         block_length = unpackInt16((uint8_t*)&header[16]) + 1; // +1 because when writing this number, we used "-1"
+        hts_log_error("Block reports length of %d", (int)block_length);
         if (block_length < BLOCK_HEADER_LENGTH)
         {
             fp->errcode |= BGZF_ERR_HEADER;
@@ -1085,7 +1229,7 @@ void *bgzf_decode_func(void *arg) {
 
     j->uncomp_len = BGZF_MAX_BLOCK_SIZE;
     int ret = bgzf_uncompress(j->uncomp_data, &j->uncomp_len,
-                              j->comp_data+18, j->comp_len-18);
+                              j->comp_data+BLOCK_HEADER_LENGTH, j->comp_len-BLOCK_HEADER_LENGTH);
     if (ret != 0)
         j->errcode |= BGZF_ERR_ZLIB;
 
